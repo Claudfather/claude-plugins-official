@@ -40,6 +40,8 @@ Writes `TELEGRAM_BOT_TOKEN=...` to `~/.claude/channels/telegram/.env`. You can a
 
 > To run multiple bots on one machine (different tokens, separate allowlists), point `TELEGRAM_STATE_DIR` at a different directory per instance.
 
+> Running a self-hosted [Bot API server](https://github.com/tdlib/telegram-bot-api)? Point `TELEGRAM_API_ROOT` at it (defaults to Telegram's hosted API).
+
 **4. Relaunch with the channel flag.**
 
 The server won't connect without this — exit your session and start a new one:
@@ -97,3 +99,12 @@ assistant needs earlier context, it will ask you to paste or summarize.
 This also means there's no `download_attachment` tool for historical messages
 — photos are downloaded eagerly on arrival since there's no way to fetch them
 later.
+
+## The getUpdates slot
+
+Telegram allows exactly one `getUpdates` consumer per token — only one
+poller can be live per bot. If the bot goes silent (especially after a
+second Claude Code session started, or with 409 Conflict in the logs),
+check `poller-audit.log` in the state dir: it records every slot decision
+and which process made it. [POLLER-SLOT.md](POLLER-SLOT.md) documents how
+the slot is managed.

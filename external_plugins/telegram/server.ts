@@ -19,7 +19,8 @@ import { z } from 'zod'
 import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, appendFileSync, utimesSync } from 'fs'
+import { execSync } from 'child_process'
 import { homedir } from 'os'
 import { join, extname, sep } from 'path'
 
@@ -58,15 +59,63 @@ const PID_FILE = join(STATE_DIR, 'bot.pid')
 // survive as an orphan and hold the slot forever, so every new session sees
 // 409 Conflict. Kill any stale holder before we start polling.
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+
+// Poller slot audit: one breadcrumb line per boot and per slot decision,
+// appended to $STATE_DIR/poller-audit.log — ts, pid/ppid, parent argv (who
+// launched this poller: the attribution trail), decision (claimed |
+// reaped pid=N | deferred pid=N). Size-guarded here at boot (keep the tail
+// once the file outgrows 256 KB) so it needs no external rotation.
+const AUDIT_FILE = join(STATE_DIR, 'poller-audit.log')
+try {
+  if (statSync(AUDIT_FILE).size > 256 * 1024) {
+    writeFileSync(AUDIT_FILE, readFileSync(AUDIT_FILE, 'utf8').split('\n').slice(-200).join('\n'))
+  }
+} catch {}
+let parentArgvCache: string | undefined
+function parentArgv(): string {
+  if (parentArgvCache !== undefined) return parentArgvCache
+  try {
+    const argv = readFileSync(`/proc/${process.ppid}/cmdline`, 'utf8').split('\0').filter(Boolean).join(' ')
+    if (argv) return (parentArgvCache = argv)
+  } catch {}
+  try {
+    return (parentArgvCache = execSync(`ps -o args= -p ${process.ppid}`, { encoding: 'utf8' }).trim())
+  } catch {}
+  return (parentArgvCache = 'unknown')
+}
+function audit(decision: string): void {
+  try {
+    appendFileSync(
+      AUDIT_FILE,
+      `${new Date().toISOString()} pid=${process.pid} ppid=${process.ppid} parent=${JSON.stringify(parentArgv())} decision=${decision}\n`,
+    )
+  } catch {}
+}
+// Prefer-live-holder: the slot belongs to a holder that is BOTH alive and
+// FRESH. Freshness = bot.pid mtime, heartbeat-touched by the holder's
+// watchdog while its poll loop runs; the threshold is 24x the 5s cadence so
+// a loaded host never mistakes a live-but-slow holder for a stale one. A
+// fresh live holder means a second instance in this state dir defers
+// (exit 0) instead of SIGTERM-ing the session's working poller out of its
+// slot. A dead (ESRCH) or stale holder is reaped/claimed exactly as before
+// — that path keeps crashed-session orphans from pinning the token.
+const STALE_HOLDER_MS = 120_000
 try {
   const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
   if (stale > 1 && stale !== process.pid) {
     process.kill(stale, 0)
+    if (Date.now() - statSync(PID_FILE).mtimeMs < STALE_HOLDER_MS) {
+      process.stderr.write(`telegram channel: deferring to live holder pid=${stale}\n`)
+      audit(`deferred pid=${stale}`)
+      process.exit(0)
+    }
     process.stderr.write(`telegram channel: replacing stale poller pid=${stale}\n`)
     process.kill(stale, 'SIGTERM')
+    audit(`reaped pid=${stale}`)
   }
 } catch {}
 writeFileSync(PID_FILE, String(process.pid))
+audit('claimed')
 
 // Last-resort safety net — without these the process dies silently on any
 // unhandled promise rejection. With them it logs and keeps serving tools.
@@ -83,7 +132,10 @@ process.on('uncaughtException', err => {
 // Strict: no bare yes/no (conversational), no prefix/suffix chatter.
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z]{5})\s*$/i
 
-const bot = new Bot(TOKEN)
+// Optional Bot API server override: a self-hosted telegram-bot-api server or
+// a local stub (the poller-slot tests use this to force deterministic 409s).
+// Defaults to Telegram's hosted API when unset.
+const bot = new Bot(TOKEN, process.env.TELEGRAM_API_ROOT ? { client: { apiRoot: process.env.TELEGRAM_API_ROOT } } : undefined)
 let botUsername = ''
 
 type PendingEntry = {
@@ -646,6 +698,10 @@ await mcp.connect(new StdioServerTransport())
 // the bot keeps polling forever as a zombie, holding the token and blocking
 // the next session with 409 Conflict.
 let shuttingDown = false
+// True only while the polling IIFE at the bottom of this file is running —
+// "poll loop alive", not "process alive". A holder whose loop has returned
+// stops heartbeating and ages into reapable staleness.
+let pollerActive = true
 function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
@@ -673,7 +729,20 @@ setInterval(() => {
     (process.platform !== 'win32' && process.ppid !== bootPpid) ||
     process.stdin.destroyed ||
     process.stdin.readableEnded
-  if (orphaned) shutdown()
+  if (orphaned) {
+    shutdown()
+  } else if (pollerActive && !shuttingDown) {
+    // Heartbeat: freshen bot.pid mtime (content untouched — the bare-pid
+    // format is load-bearing for older plugin versions and anything else
+    // that reads the file). Ownership-checked like the unlink in shutdown():
+    // never freshen a slot file that has passed to another poller.
+    try {
+      if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) {
+        const now = new Date()
+        utimesSync(PID_FILE, now, now)
+      }
+    } catch {}
+  }
 }, 5000).unref()
 
 // Commands are DM-only. Responding in groups would: (1) leak pairing codes via
@@ -1025,6 +1094,13 @@ void (async () => {
           `telegram channel: 409 Conflict persists after ${attempt} attempts — ` +
           `another poller is holding the bot token (stray 'bun server.ts' process or a second session). Exiting.\n`,
         )
+        // Release the slot for real: a bare return leaves this process alive
+        // holding bot.pid — structurally healthy, functionally deaf,
+        // invisible to anything probing pid liveness. shutdown() unlinks the
+        // pid file and exits, so whatever supervises the server (the next
+        // session, an external watchdog) sees a dead poller instead of a
+        // live deaf one.
+        shutdown()
         return
       }
       const delay = Math.min(1000 * attempt, 15000)
@@ -1035,4 +1111,8 @@ void (async () => {
       await new Promise(r => setTimeout(r, delay))
     }
   }
-})()
+})().finally(() => {
+  // The poll loop is no longer running — stop heartbeating so staleness
+  // reflects the truth.
+  pollerActive = false
+})
