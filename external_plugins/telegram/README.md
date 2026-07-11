@@ -97,3 +97,11 @@ assistant needs earlier context, it will ask you to paste or summarize.
 This also means there's no `download_attachment` tool for historical messages
 — photos are downloaded eagerly on arrival since there's no way to fetch them
 later.
+
+## The getUpdates slot
+
+Telegram allows exactly one `getUpdates` consumer per token. How this plugin
+manages that slot across sessions — the prefer-live-holder policy that keeps
+a second instance from killing a live poller, the heartbeat that makes deaf
+pollers reclaimable, and the `poller-audit.log` breadcrumb trail — is
+documented in [POLLER-SLOT.md](POLLER-SLOT.md). Tests: `bun test`.
