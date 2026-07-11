@@ -35,8 +35,7 @@ type Poller = {
   end: () => void
 }
 
-const spawned: Poller[] = []
-const decoys: ReturnType<typeof Bun.spawn>[] = []
+const procs: ReturnType<typeof Bun.spawn>[] = []
 
 // --- stub Bot API servers ---------------------------------------------------
 
@@ -104,14 +103,13 @@ function spawnPoller(apiRoot: string): Poller {
   void (async () => {
     for await (const chunk of proc.stderr) buf += decoder.decode(chunk)
   })()
-  const poller: Poller = {
+  procs.push(proc)
+  return {
     proc,
     pid: proc.pid,
     stderr: () => buf,
     end: () => proc.stdin.end(),
   }
-  spawned.push(poller)
-  return poller
 }
 
 async function waitFor(cond: () => boolean, what: string, timeoutMs = 15000): Promise<void> {
@@ -150,8 +148,7 @@ beforeAll(async () => {
 }, 120000)
 
 afterAll(() => {
-  for (const p of spawned) p.proc.kill('SIGKILL')
-  for (const d of decoys) d.kill('SIGKILL')
+  for (const p of procs) p.kill('SIGKILL')
   healthyStub.stop(true)
   conflictStub.stop(true)
   rmSync(STATE_DIR, { recursive: true, force: true })
@@ -206,7 +203,7 @@ test('an alive-but-STALE holder is reaped (deaf holders stay reclaimable)', asyn
   // A live process that never heartbeats, holding a backdated slot file —
   // the shape of a holder whose poll loop died without releasing the slot.
   const decoy = Bun.spawn({ cmd: ['sleep', '600'] })
-  decoys.push(decoy)
+  procs.push(decoy)
   writeFileSync(PID_FILE, String(decoy.pid))
   const old = new Date(Date.now() - BACKDATE_MS)
   utimesSync(PID_FILE, old, old)

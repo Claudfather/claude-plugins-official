@@ -60,27 +60,28 @@ const PID_FILE = join(STATE_DIR, 'bot.pid')
 // 409 Conflict. Kill any stale holder before we start polling.
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
 
-// --- Poller slot audit --------------------------------------------------
-// One breadcrumb line per boot and per slot decision, appended to
-// $STATE_DIR/poller-audit.log: ts, pid/ppid, parent argv (who launched this
-// poller -- the attribution trail), decision (claimed | reaped pid=N |
-// deferred pid=N). Size-guarded here at boot (keep the tail once the file
-// outgrows 256 KB) so it needs no external rotation.
+// Poller slot audit: one breadcrumb line per boot and per slot decision,
+// appended to $STATE_DIR/poller-audit.log — ts, pid/ppid, parent argv (who
+// launched this poller: the attribution trail), decision (claimed |
+// reaped pid=N | deferred pid=N). Size-guarded here at boot (keep the tail
+// once the file outgrows 256 KB) so it needs no external rotation.
 const AUDIT_FILE = join(STATE_DIR, 'poller-audit.log')
 try {
   if (statSync(AUDIT_FILE).size > 256 * 1024) {
     writeFileSync(AUDIT_FILE, readFileSync(AUDIT_FILE, 'utf8').split('\n').slice(-200).join('\n'))
   }
 } catch {}
+let parentArgvCache: string | undefined
 function parentArgv(): string {
+  if (parentArgvCache !== undefined) return parentArgvCache
   try {
     const argv = readFileSync(`/proc/${process.ppid}/cmdline`, 'utf8').split('\0').filter(Boolean).join(' ')
-    if (argv) return argv
+    if (argv) return (parentArgvCache = argv)
   } catch {}
   try {
-    return execSync(`ps -o args= -p ${process.ppid}`, { encoding: 'utf8' }).trim()
+    return (parentArgvCache = execSync(`ps -o args= -p ${process.ppid}`, { encoding: 'utf8' }).trim())
   } catch {}
-  return 'unknown'
+  return (parentArgvCache = 'unknown')
 }
 function audit(decision: string): void {
   try {
@@ -97,7 +98,7 @@ function audit(decision: string): void {
 // fresh live holder means a second instance in this state dir defers
 // (exit 0) instead of SIGTERM-ing the session's working poller out of its
 // slot. A dead (ESRCH) or stale holder is reaped/claimed exactly as before
-// -- that path keeps crashed-session orphans from pinning the token.
+// — that path keeps crashed-session orphans from pinning the token.
 const STALE_HOLDER_MS = 120_000
 try {
   const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
@@ -697,7 +698,7 @@ await mcp.connect(new StdioServerTransport())
 // the bot keeps polling forever as a zombie, holding the token and blocking
 // the next session with 409 Conflict.
 let shuttingDown = false
-// True only while the polling IIFE at the bottom of this file is running --
+// True only while the polling IIFE at the bottom of this file is running —
 // "poll loop alive", not "process alive". A holder whose loop has returned
 // stops heartbeating and ages into reapable staleness.
 let pollerActive = true
@@ -731,10 +732,10 @@ setInterval(() => {
   if (orphaned) {
     shutdown()
   } else if (pollerActive && !shuttingDown) {
-    // Heartbeat: freshen bot.pid mtime (content untouched -- the bare-pid
-    // format is load-bearing for fleet tooling and older plugin versions).
-    // Ownership-checked like the unlink in shutdown(): never freshen a slot
-    // file that has passed to another poller.
+    // Heartbeat: freshen bot.pid mtime (content untouched — the bare-pid
+    // format is load-bearing for older plugin versions and anything else
+    // that reads the file). Ownership-checked like the unlink in shutdown():
+    // never freshen a slot file that has passed to another poller.
     try {
       if (parseInt(readFileSync(PID_FILE, 'utf8'), 10) === process.pid) {
         const now = new Date()
@@ -1094,9 +1095,11 @@ void (async () => {
           `another poller is holding the bot token (stray 'bun server.ts' process or a second session). Exiting.\n`,
         )
         // Release the slot for real: a bare return leaves this process alive
-        // holding bot.pid -- structurally healthy, functionally deaf,
-        // invisible to detection. shutdown() unlinks the pid file and exits
-        // so the slot frees and fleet-side recovery can act on no_bridge.
+        // holding bot.pid — structurally healthy, functionally deaf,
+        // invisible to anything probing pid liveness. shutdown() unlinks the
+        // pid file and exits, so whatever supervises the server (the next
+        // session, an external watchdog) sees a dead poller instead of a
+        // live deaf one.
         shutdown()
         return
       }
@@ -1109,7 +1112,7 @@ void (async () => {
     }
   }
 })().finally(() => {
-  // The poll loop is no longer running -- stop heartbeating so staleness
+  // The poll loop is no longer running — stop heartbeating so staleness
   // reflects the truth.
   pollerActive = false
 })
