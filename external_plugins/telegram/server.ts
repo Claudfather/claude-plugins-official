@@ -1065,12 +1065,32 @@ bot.catch(err => {
 // returned, and polling stopped permanently while the process stayed alive
 // (MCP stdin keeps it running). Outbound tools kept working but the bot was
 // deaf to inbound messages until a full restart.
+// A poller that STARTS is not a poller that WORKS. onStart fires once getMe
+// succeeds, but a mid-life 409 is raised later, by getUpdates. Resetting the
+// attempt counter on every onStart therefore reset it on every iteration of a
+// mid-life conflict — which made the exhaustion branch below unreachable (the
+// counter was always 0 at the check) and pinned the backoff at 1000*0 = 0ms,
+// i.e. a busy loop. That single line defeated BOTH slot-safety mechanisms at
+// once: the exhaustion release (POLLER-SLOT.md §3) never fired, and because a
+// busy loop IS a running poll loop, the 5s heartbeat kept bot.pid fresh, so the
+// staleness reap (§2) never fired either and every newcomer correctly deferred
+// to a holder that had been deaf for hours.
+//
+// So reset on demonstrated health, not on a start event: only a poller that
+// stayed up long enough to have actually served traffic clears its backoff.
+// Below that bar, attempts accumulate and a genuinely stuck poller reaches the
+// exhaustion branch, releases the slot and exits — which is what lets keepalive
+// respawn a live one.
+const STABLE_MS = 30_000
+let attempt = 0
+let startedAt = 0
+
 void (async () => {
-  for (let attempt = 1; ; attempt++) {
+  for (;;) {
     try {
       await bot.start({
         onStart: info => {
-          attempt = 0
+          startedAt = Date.now()
           botUsername = info.username
           process.stderr.write(`telegram channel: polling as @${info.username}\n`)
           void bot.api.setMyCommands(
@@ -1088,6 +1108,10 @@ void (async () => {
       if (shuttingDown) return
       // bot.stop() mid-setup rejects with grammy's "Aborted delay" — expected, not an error.
       if (err instanceof Error && err.message === 'Aborted delay') return
+      // Demonstrated health — not a mere start — clears the backoff.
+      if (startedAt !== 0 && Date.now() - startedAt >= STABLE_MS) attempt = 0
+      startedAt = 0
+      attempt++
       const is409 = err instanceof GrammyError && err.error_code === 409
       if (is409 && attempt >= 8) {
         process.stderr.write(
