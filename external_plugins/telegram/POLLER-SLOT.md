@@ -88,6 +88,41 @@ Supporting change: `TELEGRAM_API_ROOT` overrides grammy's `apiRoot` — it
 makes the plugin usable against self-hosted Bot API servers and gives the
 test suite a way to force deterministic 409s locally.
 
+## Follow-up: the mid-life 409, where §2 and §3 both failed to fire
+
+Change 3 above shipped, and did not work for the 409 that actually happens in
+production. The retry loop reset its attempt counter inside `onStart`:
+
+```ts
+for (let attempt = 1; ; attempt++) {
+  await bot.start({ onStart: info => { attempt = 0; ... } })
+```
+
+`onStart` fires when **`getMe`** succeeds; a mid-life 409 is raised afterwards,
+by **`getUpdates`**. So every iteration reset the counter *before* the failure
+was counted, and two things followed:
+
+- `attempt >= 8` was never true — **the §3 exhaustion release was unreachable**
+- `Math.min(1000 * attempt, 15000)` with `attempt === 0` is `0` — a busy loop
+
+And because a busy loop *is* a running poll loop, the heartbeat kept touching
+`bot.pid`, so **§2 staleness reaping never fired either** and every newcomer
+correctly deferred (§1) to a holder that had been deaf for hours. Measured on a
+stub API: **5,317 `retrying in 0s` in 10 seconds, no exhaustion, ever.**
+
+The fix is to reset on *demonstrated health* rather than on a start event — a
+poller must stay up `STABLE_MS` before its backoff clears. A stuck poller then
+accumulates attempts, exhausts, and releases the slot; a poller that recovers
+from a transient conflict still gets its counter cleared and is not evicted for
+unrelated blips accumulated over a long life.
+
+**Why the original test suite missed it:** `conflictStub` answers 409 to *every*
+call including `getMe`, so `onStart` never fires and attempts accumulate by
+accident. That covers the **cold** 409 (booting into a held slot); it cannot
+express the **mid-life** one. `midlifeConflictStub` (getMe ok, getUpdates 409)
+and `flakyStub` (transient, then healthy) cover both directions now. Both fail
+against the pre-fix server.
+
 ## What is deliberately NOT done
 
 - **No lock file.** Deferral *is* the lock semantics; a separate lock file

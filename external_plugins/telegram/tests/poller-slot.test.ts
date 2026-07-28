@@ -80,6 +80,58 @@ const conflictStub = Bun.serve({
   },
 })
 
+// Mid-life conflict: getMe SUCCEEDS, getUpdates 409s. This is the production
+// shape and the one conflictStub above cannot express — because getMe succeeds,
+// onStart fires on every iteration, which is exactly what used to reset the
+// attempt counter and strand the poller in a deaf busy loop.
+const midlifeConflictStub = Bun.serve({
+  port: 0,
+  fetch(req) {
+    const method = new URL(req.url).pathname.split('/').pop() ?? ''
+    if (method === 'getMe') {
+      return botApiJson({
+        ok: true,
+        result: { id: 8888888, is_bot: true, first_name: 'stub', username: 'slot_test_bot' },
+      })
+    }
+    if (method === 'getUpdates') {
+      return botApiJson(
+        { ok: false, error_code: 409, description: 'Conflict: terminated by other getUpdates request' },
+        409,
+      )
+    }
+    return botApiJson({ ok: true, result: true })
+  },
+})
+
+// Transient mid-life conflict: the first two getUpdates 409, then the slot
+// frees up and polling works. A poller must RIDE THIS OUT, not exit — the
+// fix must not turn a recoverable blip into a self-eviction.
+let flakyConflicts = 0
+const flakyStub = Bun.serve({
+  port: 0,
+  async fetch(req) {
+    const method = new URL(req.url).pathname.split('/').pop() ?? ''
+    if (method === 'getMe') {
+      return botApiJson({
+        ok: true,
+        result: { id: 8888888, is_bot: true, first_name: 'stub', username: 'slot_test_bot' },
+      })
+    }
+    if (method === 'getUpdates') {
+      if (flakyConflicts++ < 2) {
+        return botApiJson(
+          { ok: false, error_code: 409, description: 'Conflict: terminated by other getUpdates request' },
+          409,
+        )
+      }
+      await Bun.sleep(1000)
+      return botApiJson({ ok: true, result: [] })
+    }
+    return botApiJson({ ok: true, result: true })
+  },
+})
+
 // --- helpers -----------------------------------------------------------------
 
 function spawnPoller(apiRoot: string): Poller {
@@ -140,6 +192,8 @@ function alive(pid: number): boolean {
 
 const healthyRoot = `http://127.0.0.1:${healthyStub.port}`
 const conflictRoot = `http://127.0.0.1:${conflictStub.port}`
+const midlifeRoot = `http://127.0.0.1:${midlifeConflictStub.port}`
+const flakyRoot = `http://127.0.0.1:${flakyStub.port}`
 
 beforeAll(async () => {
   // server.ts imports resolve from the plugin dir; make sure deps exist.
@@ -151,6 +205,8 @@ afterAll(() => {
   for (const p of procs) p.kill('SIGKILL')
   healthyStub.stop(true)
   conflictStub.stop(true)
+  midlifeConflictStub.stop(true)
+  flakyStub.stop(true)
   rmSync(STATE_DIR, { recursive: true, force: true })
 })
 
@@ -249,3 +305,57 @@ test('the audit trail tells the whole story in a parseable format', () => {
     )
   }
 })
+
+
+// --- mid-life 409: the production shape (issue #4) ---------------------------
+//
+// conflictStub 409s getMe too, so onStart never fires and attempts accumulate
+// by accident. In production getMe succeeds and only getUpdates 409s — onStart
+// fires every iteration. The counter used to reset there, so the exhaustion
+// branch was unreachable and the backoff computed to 1000*0 = 0ms: a deaf busy
+// loop whose still-running poll loop kept bot.pid fresh, defeating the
+// staleness reap as well. Both tests below fail on the pre-fix server.ts.
+
+test('a persistent MID-LIFE 409 (getMe ok, getUpdates 409) exhausts and RELEASES the slot', async () => {
+  await waitFor(() => pidFile() === null, 'the slot to be free before this scenario', 10000)
+
+  const F = spawnPoller(midlifeRoot)
+  await waitFor(() => pidFile() === String(F.pid), 'F to claim the slot')
+  // It really does start polling — this is what makes it the mid-life shape.
+  await waitFor(() => F.stderr().includes('polling as @'), 'F to start polling')
+
+  await waitFor(
+    () => F.stderr().includes('409 Conflict persists after 8 attempts'),
+    'F to exhaust its 409 retries despite onStart firing each iteration',
+    50000,
+  )
+  await F.proc.exited
+  await waitFor(() => pidFile() === null, 'F to release the slot on exit', 5000)
+
+  // The busy-loop signature: a 0s retry. Backoff must actually back off.
+  expect(F.stderr()).not.toInclude('retrying in 0s')
+  expect(F.stderr()).toInclude('retrying in 1s')
+  expect(F.stderr()).toInclude('shutting down')
+  expect(alive(F.pid)).toBe(false)
+}, 70000)
+
+test('a TRANSIENT mid-life 409 recovers and keeps polling (no self-eviction)', async () => {
+  await waitFor(() => pidFile() === null, 'the slot to be free before this scenario', 10000)
+
+  const G = spawnPoller(flakyRoot)
+  await waitFor(() => pidFile() === String(G.pid), 'G to claim the slot')
+  await waitFor(() => G.stderr().includes('409 Conflict'), 'G to hit the transient conflict', 15000)
+
+  // Once the conflict clears it must settle into polling and STAY — the whole
+  // point of a recoverable blip is that it is survivable.
+  await waitFor(() => flakyConflicts > 2, 'the stub to stop conflicting', 20000)
+  await Bun.sleep(3000)
+
+  expect(alive(G.pid)).toBe(true)
+  expect(pidFile()).toBe(String(G.pid))
+  expect(G.stderr()).not.toInclude('persists after 8 attempts')
+  expect(G.stderr()).not.toInclude('retrying in 0s')
+
+  G.end()
+  await G.proc.exited
+}, 60000)
