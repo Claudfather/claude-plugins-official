@@ -51,7 +51,8 @@ is *both alive and fresh*. A newcomer that finds one logs
 `deferring to live holder pid=<N>` and exits 0 — it never signals a live,
 working peer. Dead holders (ESRCH on the probe) are claimed exactly as
 before; alive-but-stale holders are SIGTERMed exactly as before. The only
-behavior change is for the one case the old code got wrong.
+behavior change is for the one case the old code got wrong. Both decisions
+now run only after the recycled-PID check (below).
 
 **2. Heartbeat (freshness signal).** The holder freshens `bot.pid`'s *mtime*
 every 5s from the already-existing orphan-watchdog interval — content is
@@ -77,6 +78,8 @@ of a live deaf one, and can act.
 2026-07-11T14:47:51.379Z pid=829766 ppid=829757 parent="bun run --cwd ... start" decision=deferred pid=829738
 2026-07-11T14:47:52.838Z pid=829836 ppid=829827 parent="bun run --cwd ... start" decision=reaped pid=829824
 ```
+
+A fourth decision, `ignored pid=<N>`, records a recycled PID (see below).
 
 `parent` is the launching process's argv (`/proc/<ppid>/cmdline`, `ps`
 fallback off-Linux, best-effort). The first hijack *attempt* after deployment
@@ -123,6 +126,22 @@ express the **mid-life** one. `midlifeConflictStub` (getMe ok, getUpdates 409)
 and `flakyStub` (transient, then healthy) cover both directions now. Both fail
 against the pre-fix server.
 
+## Recycled PIDs: only a server.ts can hold the slot
+
+A holder that dies uncleanly (SIGKILL, OOM, a crash) leaves its pid in
+`bot.pid`, and the kernel can hand that pid to any new process. Stock v0.0.7
+added a check before the SIGTERM: `ps -p <pid> -o args=` must name
+`server.ts`. This fork runs the same check before *both* boot decisions. A
+live process whose argv does not name `server.ts` is not a holder, so the
+newcomer neither signals it nor defers to it: it audits
+`decision=ignored pid=<N>` and claims the slot. Deferring to such a process
+would leave the token with no poller at all.
+
+The check reads argv, not identity, so a reused pid that lands on another
+`server.ts` still reads as a holder: on a host that runs several bots, that
+can be a different bot's poller. Without a `ps` binary the check throws and
+the newcomer claims, as stock's does.
+
 ## What is deliberately NOT done
 
 - **No lock file.** Deferral *is* the lock semantics; a separate lock file
@@ -131,8 +150,8 @@ against the pre-fix server.
   breaks every existing reader of the bare-pid format and makes mixed-version
   rollout hazardous. mtime carries exactly the one needed bit.
 - **No change to the dead-holder path.** ESRCH-probe-then-claim keeps its
-  pre-existing semantics, including its narrow pid-reuse window — unchanged,
-  not widened by this design.
+  pre-existing semantics. Its pid-reuse window is now closed for any process
+  that is not a `server.ts` (see Recycled PIDs above).
 - **Defer = exit 0 (minimal form).** A richer variant would stay resident and
   serve *outbound-only* tools (sendMessage needs no slot) while skipping
   `bot.start()`. Either satisfies the fix; the minimal form is what is
@@ -146,8 +165,10 @@ against the pre-fix server.
 - Old newcomer + new holder: the old newcomer still murders (it has the old
   code). Full protection requires all instances in an environment to run the
   new version.
-- The pid-file format, shutdown ownership check, and orphan watchdog are
-  unchanged.
+- The pid-file format and shutdown ownership check are unchanged. The orphan
+  watchdog follows stock v0.0.7: it watches stdin only (stock dropped the
+  ppid check because it false-fires when a wrapper exits), and the heartbeat
+  still runs on its 5s interval.
 
 ## Tests
 

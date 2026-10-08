@@ -1,6 +1,7 @@
 /**
  * getUpdates slot-policy tests: prefer-live-holder, dead/stale reap,
- * heartbeat, 409 slot release, audit trail. See POLLER-SLOT.md.
+ * recycled-PID guard, heartbeat, 409 slot release, audit trail. See
+ * POLLER-SLOT.md.
  *
  * Every poller is pointed at a LOCAL stub Bot API via TELEGRAM_API_ROOT
  * (a healthy stub for the slot-mechanics tests, an always-409 stub for
@@ -11,8 +12,8 @@
  *
  * The scenarios run in file order and share one state dir on purpose —
  * the slot lifecycle under test IS sequential (claim → hijack attempt →
- * crash → reap → staleness → release), and the audit log at the end
- * must show that whole story.
+ * crash → reap → staleness → release → recycled PID), and the audit log
+ * at the end must show that whole story.
  */
 import { afterAll, beforeAll, expect, test } from 'bun:test'
 import { mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'fs'
@@ -24,6 +25,11 @@ const STATE_DIR = mkdtempSync(join(tmpdir(), 'tg-poller-slot-'))
 const PID_FILE = join(STATE_DIR, 'bot.pid')
 const AUDIT_FILE = join(STATE_DIR, 'poller-audit.log')
 const FAKE_TOKEN = '8888888:AAAAAAAAAAAAAAAAAAAA'
+
+// A stand-in holder whose argv reads `bun server.ts` but which never polls or
+// heartbeats: the reap path signals only a server.ts process.
+const DECOY_DIR = mkdtempSync(join(tmpdir(), 'tg-decoy-'))
+writeFileSync(join(DECOY_DIR, 'server.ts'), 'setInterval(() => {}, 1 << 30)\n')
 
 // Stale threshold in server.ts is 120s (24x the 5s heartbeat cadence).
 const BACKDATE_MS = 10 * 60 * 1000
@@ -208,6 +214,7 @@ afterAll(() => {
   midlifeConflictStub.stop(true)
   flakyStub.stop(true)
   rmSync(STATE_DIR, { recursive: true, force: true })
+  rmSync(DECOY_DIR, { recursive: true, force: true })
 })
 
 // --- the slot lifecycle -------------------------------------------------------
@@ -246,8 +253,11 @@ test('a DEAD holder is still reaped (crashed-session orphans cannot pin the toke
 
   C = spawnPoller(healthyRoot)
   await waitFor(() => pidFile() === String(C.pid), 'C to claim the crashed slot')
-  expect(readFileSync(AUDIT_FILE, 'utf8')).toMatch(
-    new RegExp(`pid=${C.pid} .*decision=claimed`),
+  // server.ts appends the claim's audit line just after it writes bot.pid,
+  // so wait for the line rather than read the log once.
+  await waitFor(
+    () => new RegExp(`pid=${C.pid} .*decision=claimed`).test(readFileSync(AUDIT_FILE, 'utf8')),
+    'C to audit its claim',
   )
 }, 20000)
 
@@ -256,9 +266,9 @@ test('an alive-but-STALE holder is reaped (deaf holders stay reclaimable)', asyn
   await C.proc.exited
   await waitFor(() => pidFile() === null, 'C to release the slot')
 
-  // A live process that never heartbeats, holding a backdated slot file —
+  // A live server.ts that never heartbeats, holding a backdated slot file —
   // the shape of a holder whose poll loop died without releasing the slot.
-  const decoy = Bun.spawn({ cmd: ['sleep', '600'] })
+  const decoy = Bun.spawn({ cmd: ['bun', 'server.ts'], cwd: DECOY_DIR })
   procs.push(decoy)
   writeFileSync(PID_FILE, String(decoy.pid))
   const old = new Date(Date.now() - BACKDATE_MS)
@@ -295,13 +305,54 @@ test('persistent 409 exhaustion EXITS and RELEASES the slot (no deaf zombie)', a
   expect(E.stderr()).toInclude('shutting down')
 }, 60000)
 
+// --- recycled PIDs: bot.pid names a live process that is not a poller --------
+//
+// PIDs wrap. A holder that died uncleanly leaves its pid in bot.pid, and the
+// kernel can hand that pid to any new process. Only a server.ts process can be
+// a holder, so a newcomer must neither SIGTERM such a process nor defer to it.
+
+test('a recycled PID at a STALE bot.pid is not signalled, and the newcomer claims', async () => {
+  const stranger = Bun.spawn({ cmd: ['sleep', '600'] })
+  procs.push(stranger)
+  writeFileSync(PID_FILE, String(stranger.pid))
+  const old = new Date(Date.now() - BACKDATE_MS)
+  utimesSync(PID_FILE, old, old)
+
+  const H = spawnPoller(healthyRoot)
+  await waitFor(() => pidFile() === String(H.pid), 'H to claim the slot')
+  await Bun.sleep(200)
+  expect(H.stderr()).not.toInclude('replacing stale poller')
+  expect(alive(stranger.pid)).toBe(true)
+  expect(readFileSync(AUDIT_FILE, 'utf8')).toInclude(`decision=ignored pid=${stranger.pid}`)
+  H.end()
+  await H.proc.exited
+  await waitFor(() => pidFile() === null, 'H to release the slot')
+}, 20000)
+
+test('a recycled PID at a FRESH bot.pid is not deferred to, and the newcomer claims', async () => {
+  // Fresh mtime: the holder died uncleanly moments ago and its pid was reused.
+  const stranger = Bun.spawn({ cmd: ['sleep', '600'] })
+  procs.push(stranger)
+  writeFileSync(PID_FILE, String(stranger.pid))
+
+  const I = spawnPoller(healthyRoot)
+  await waitFor(() => pidFile() === String(I.pid), 'I to claim the slot')
+  expect(I.stderr()).not.toInclude('deferring to live holder')
+  expect(alive(stranger.pid)).toBe(true)
+  expect(readFileSync(AUDIT_FILE, 'utf8')).toInclude(`decision=ignored pid=${stranger.pid}`)
+  I.end()
+  await I.proc.exited
+  await waitFor(() => pidFile() === null, 'I to release the slot')
+}, 20000)
+
 test('the audit trail tells the whole story in a parseable format', () => {
   const lines = readFileSync(AUDIT_FILE, 'utf8').trim().split('\n')
-  // A claimed, B deferred, C claimed, D reaped + claimed, E claimed.
-  expect(lines.length).toBeGreaterThanOrEqual(6)
+  // A claimed, B deferred, C claimed, D reaped + claimed, E claimed,
+  // H and I each ignored + claimed.
+  expect(lines.length).toBeGreaterThanOrEqual(10)
   for (const line of lines) {
     expect(line).toMatch(
-      /^\d{4}-\d{2}-\d{2}T[\d:.]+Z pid=\d+ ppid=\d+ parent=".*" decision=(claimed|deferred pid=\d+|reaped pid=\d+)$/,
+      /^\d{4}-\d{2}-\d{2}T[\d:.]+Z pid=\d+ ppid=\d+ parent=".*" decision=(claimed|deferred pid=\d+|reaped pid=\d+|ignored pid=\d+)$/,
     )
   }
 })

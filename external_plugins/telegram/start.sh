@@ -39,10 +39,11 @@ CACHE_DIR="${BUN_INSTALL_CACHE_DIR:-${BUN_INSTALL:-$HOME/.bun}/install/cache}"
 mkdir -p "$CACHE_DIR" 2>/dev/null || CACHE_DIR="${TMPDIR:-/tmp}"
 GLOBAL_LOCK="$CACHE_DIR/.claude-plugin-install.lock"
 
+# Install output goes to stderr: stdout is the MCP stdio transport.
 if command -v flock >/dev/null 2>&1; then
     flock "$DIR_LOCK" sh -c '
         [ -d "$1" ] && exit 0
-        flock "$2" bun install --frozen-lockfile --no-summary
+        flock "$2" bun install --frozen-lockfile --no-summary 1>&2
     ' _ "$DEPS" "$GLOBAL_LOCK"
 else
     # No flock (stock macOS). mkdir is atomic on POSIX, so it serves as a
@@ -54,7 +55,7 @@ else
         [ "$waited" -ge 120 ] && break
         sleep 1
     done
-    [ -d "$DEPS" ] || bun install --frozen-lockfile --no-summary
+    [ -d "$DEPS" ] || bun install --frozen-lockfile --no-summary 1>&2
     rmdir "$DIR_LOCK.d" 2>/dev/null || true
 fi
 
