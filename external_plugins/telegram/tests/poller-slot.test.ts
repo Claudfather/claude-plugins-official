@@ -253,8 +253,11 @@ test('a DEAD holder is still reaped (crashed-session orphans cannot pin the toke
 
   C = spawnPoller(healthyRoot)
   await waitFor(() => pidFile() === String(C.pid), 'C to claim the crashed slot')
-  expect(readFileSync(AUDIT_FILE, 'utf8')).toMatch(
-    new RegExp(`pid=${C.pid} .*decision=claimed`),
+  // server.ts appends the claim's audit line just after it writes bot.pid,
+  // so wait for the line rather than read the log once.
+  await waitFor(
+    () => new RegExp(`pid=${C.pid} .*decision=claimed`).test(readFileSync(AUDIT_FILE, 'utf8')),
+    'C to audit its claim',
   )
 }, 20000)
 
