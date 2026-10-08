@@ -20,11 +20,12 @@ import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'gramm
 import type { ReactionTypeEmoji } from 'grammy/types'
 import { randomBytes } from 'crypto'
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync, appendFileSync, utimesSync } from 'fs'
-import { execSync } from 'child_process'
 import { homedir } from 'os'
+import { execFileSync, execSync } from 'child_process'
 import { join, extname, sep } from 'path'
 
-const STATE_DIR = process.env.TELEGRAM_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'telegram')
+const STATE_DIR = process.env.TELEGRAM_STATE_DIR
+  ?? join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'), 'channels', 'telegram')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const APPROVED_DIR = join(STATE_DIR, 'approved')
 const ENV_FILE = join(STATE_DIR, '.env')
@@ -63,8 +64,9 @@ mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
 // Poller slot audit: one breadcrumb line per boot and per slot decision,
 // appended to $STATE_DIR/poller-audit.log — ts, pid/ppid, parent argv (who
 // launched this poller: the attribution trail), decision (claimed |
-// reaped pid=N | deferred pid=N). Size-guarded here at boot (keep the tail
-// once the file outgrows 256 KB) so it needs no external rotation.
+// reaped pid=N | deferred pid=N | ignored pid=N, the last for a recycled
+// pid). Size-guarded here at boot (keep the tail once the file outgrows
+// 256 KB) so it needs no external rotation.
 const AUDIT_FILE = join(STATE_DIR, 'poller-audit.log')
 try {
   if (statSync(AUDIT_FILE).size > 256 * 1024) {
@@ -104,14 +106,25 @@ try {
   const stale = parseInt(readFileSync(PID_FILE, 'utf8'), 10)
   if (stale > 1 && stale !== process.pid) {
     process.kill(stale, 0)
-    if (Date.now() - statSync(PID_FILE).mtimeMs < STALE_HOLDER_MS) {
-      process.stderr.write(`telegram channel: deferring to live holder pid=${stale}\n`)
-      audit(`deferred pid=${stale}`)
-      process.exit(0)
+    // PID files race with OS PID recycling — verify the holder is actually a
+    // server.ts process before SIGTERM. Otherwise a recycled PID can point at
+    // our own bun-run wrapper (kills our stdin → immediate self-shutdown) or
+    // an unrelated user process.
+    // The same check gates deferring: a recycled PID is not a live holder, and
+    // deferring to one would leave the token with no poller at all.
+    const cmd = execFileSync('ps', ['-p', String(stale), '-o', 'args='], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
+    if (cmd.includes('server.ts')) {
+      if (Date.now() - statSync(PID_FILE).mtimeMs < STALE_HOLDER_MS) {
+        process.stderr.write(`telegram channel: deferring to live holder pid=${stale}\n`)
+        audit(`deferred pid=${stale}`)
+        process.exit(0)
+      }
+      process.stderr.write(`telegram channel: replacing stale poller pid=${stale}\n`)
+      process.kill(stale, 'SIGTERM')
+      audit(`reaped pid=${stale}`)
+    } else {
+      audit(`ignored pid=${stale}`)
     }
-    process.stderr.write(`telegram channel: replacing stale poller pid=${stale}\n`)
-    process.kill(stale, 'SIGTERM')
-    audit(`reaped pid=${stale}`)
   }
 } catch {}
 writeFileSync(PID_FILE, String(process.pid))
@@ -720,16 +733,14 @@ process.on('SIGTERM', shutdown)
 process.on('SIGINT', shutdown)
 process.on('SIGHUP', shutdown)
 
-// Orphan watchdog: stdin events above don't reliably fire when the parent
-// chain (`bun run` wrapper → shell → us) is severed by a crash. Poll for
-// reparenting (POSIX) or a dead stdin pipe and self-terminate.
-const bootPpid = process.ppid
+// Orphan watchdog: belt-and-suspenders for the stdin 'end'/'close' handlers
+// above. Stdin is the MCP transport pipe inherited straight from the CLI; the
+// kernel closes it on any CLI death (clean, crash, SIGKILL, OOM) regardless of
+// intermediate wrappers. A ppid-change check used to live here but it
+// false-fires when the bun-run/shell wrapper exits or execs during normal
+// startup and we get reparented to init.
 setInterval(() => {
-  const orphaned =
-    (process.platform !== 'win32' && process.ppid !== bootPpid) ||
-    process.stdin.destroyed ||
-    process.stdin.readableEnded
-  if (orphaned) {
+  if (process.stdin.destroyed || process.stdin.readableEnded) {
     shutdown()
   } else if (pollerActive && !shuttingDown) {
     // Heartbeat: freshen bot.pid mtime (content untouched — the bare-pid
